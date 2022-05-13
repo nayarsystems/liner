@@ -5,6 +5,7 @@ package liner
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"os"
 	"os/signal"
@@ -22,18 +23,21 @@ type nexter struct {
 // State represents an open terminal
 type State struct {
 	commonState
-	origMode    termios
-	defaultMode termios
-	next        <-chan nexter
-	winch       chan os.Signal
-	pending     []rune
-	useCHA      bool
+	origMode      termios
+	defaultMode   termios
+	next          <-chan nexter
+	winch         chan os.Signal
+	pending       []rune
+	useCHA        bool
+	refreshSignal chan interface{}
+	ctx           context.Context
 }
 
 // NewLiner initializes a new *State, and sets the terminal into raw mode. To
 // restore the terminal to its previous state, call State.Close().
-func NewLiner() *State {
+func NewLiner(ctx context.Context) *State {
 	var s State
+	s.ctx = ctx
 	s.r = bufio.NewReader(os.Stdin)
 
 	s.terminalSupported = TerminalSupported()
@@ -68,6 +72,8 @@ func NewLiner() *State {
 		s.outputRedirected = !s.getColumns()
 	}
 
+	s.refreshSignal = make(chan interface{}, 1)
+
 	return &s
 }
 
@@ -87,6 +93,13 @@ func (s *State) startPrompt() {
 
 func (s *State) inputWaiting() bool {
 	return len(s.next) > 0
+}
+
+func (s *State) Refresh() {
+	select {
+	case s.refreshSignal <- 0:
+	default:
+	}
 }
 
 func (s *State) restartPrompt() {
@@ -127,6 +140,15 @@ func (s *State) nextPending(timeout <-chan time.Time) (rune, error) {
 		rv := s.pending[0]
 		s.pending = s.pending[1:]
 		return rv, errTimedOut
+	case <-s.refreshSignal:
+		s.needRefresh = true
+		rv := s.pending[0]
+		s.pending = s.pending[1:]
+		return rv, errTimedOut
+	case <-s.ctx.Done():
+		rv := s.pending[0]
+		s.pending = s.pending[1:]
+		return rv, ErrInternal
 	}
 }
 
@@ -149,6 +171,11 @@ func (s *State) readNext() (interface{}, error) {
 	case <-s.winch:
 		s.getColumns()
 		return winch, nil
+	case <-s.refreshSignal:
+		s.needRefresh = true
+		return cr, nil
+	case <-s.ctx.Done():
+		return 0, ErrInternal
 	}
 	if r != esc {
 		return r, nil
